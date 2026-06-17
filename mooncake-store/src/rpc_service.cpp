@@ -1194,13 +1194,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_end_requests(total_keys);
 
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-
-    for (const auto& key : keys) {
-        results.emplace_back(
-            master_service_.PutEnd(client_id, key, tenant_id, replica_type));
-    }
+    auto results =
+        master_service_.BatchPutEnd(client_id, keys, tenant_id, replica_type);
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -1234,13 +1229,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_revoke_requests(total_keys);
 
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-
-    for (const auto& key : keys) {
-        results.emplace_back(
-            master_service_.PutRevoke(client_id, key, tenant_id, replica_type));
-    }
+    auto results = master_service_.BatchPutRevoke(client_id, keys, tenant_id,
+                                                  replica_type);
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {

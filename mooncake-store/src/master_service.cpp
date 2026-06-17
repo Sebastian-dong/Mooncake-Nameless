@@ -1906,23 +1906,231 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id, ReplicaType replica_type) {
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(PutEnd(client_id, key, tenant_id, replica_type));
+    std::vector<tl::expected<void, ErrorCode>> results(keys.size());
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
+
+    std::unordered_map<size_t,
+                       std::vector<std::pair<size_t, const std::string*>>>
+        keys_by_shard;
+    keys_by_shard.reserve(
+        std::min(keys.size(), static_cast<size_t>(kNumShards)));
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        size_t shard_idx = getMetadataShardIndex(normalized_tenant, keys[i]);
+        keys_by_shard[shard_idx].emplace_back(i, &keys[i]);
     }
+
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    int64_t mem_cache_incs = 0;
+    int64_t file_cache_incs = 0;
+
+    for (auto& [shard_idx, key_group] : keys_by_shard) {
+        MetadataShardAccessorRW shard(this, shard_idx);
+        for (const auto& [original_idx, key_ptr] : key_group) {
+            const std::string& key = *key_ptr;
+            auto tenant_it = shard->tenants.find(normalized_tenant);
+            if (tenant_it == shard->tenants.end()) {
+                LOG(ERROR) << "key=" << key << ", error=object_not_found";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                continue;
+            }
+
+            auto& tenant_state = tenant_it->second;
+            auto it = tenant_state.metadata.find(key);
+            if (it == tenant_state.metadata.end() || !it->second.IsValid()) {
+                LOG(ERROR) << "key=" << key << ", error=object_not_found";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                continue;
+            }
+
+            const auto object_id = MakeObjectIdentity(key, normalized_tenant);
+            auto& metadata = it->second;
+            if (client_id != metadata.client_id) {
+                LOG(ERROR) << "Illegal client " << client_id
+                           << " to PutEnd key " << key
+                           << ", was PutStart-ed by " << metadata.client_id;
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+                continue;
+            }
+
+            metadata.VisitReplicas(
+                [replica_type](const Replica& replica) {
+                    if (replica_type == ReplicaType::ALL) {
+                        return (replica.is_memory_replica() &&
+                                !replica.has_invalid_mem_handle()) ||
+                               (replica.is_nof_replica() &&
+                                !replica.has_invalid_nof_handle());
+                    }
+                    if (replica_type == ReplicaType::MEMORY) {
+                        return replica.is_memory_replica() &&
+                               !replica.has_invalid_mem_handle();
+                    }
+                    if (replica_type == ReplicaType::NOF_SSD) {
+                        return replica.is_nof_replica() &&
+                               !replica.has_invalid_nof_handle();
+                    }
+                    return replica.type() == replica_type;
+                },
+                [](Replica& replica) { replica.mark_complete(); });
+
+            if (enable_offload_ && !offload_on_evict_) {
+                metadata.VisitReplicas(
+                    [](const Replica& replica) {
+                        return replica.is_completed() &&
+                               replica.is_memory_replica();
+                    },
+                    [this, &object_id, &tenant_state](Replica& replica) {
+                        auto result = PushOffloadingQueue(object_id, replica);
+                        if (result) {
+                            replica.inc_refcnt();
+                            tenant_state.offloading_tasks.emplace(
+                                object_id.user_key,
+                                OffloadingTask{
+                                    replica.id(),
+                                    std::chrono::system_clock::now()});
+                        }
+                    });
+            }
+
+            if (metadata.AllReplicas(&Replica::fn_is_completed)) {
+                tenant_state.processing_keys.erase(key);
+            }
+
+            if (replica_type == ReplicaType::MEMORY ||
+                (replica_type == ReplicaType::ALL &&
+                 metadata.HasMemReplica())) {
+                ++mem_cache_incs;
+            } else if (replica_type == ReplicaType::DISK) {
+                ++file_cache_incs;
+            }
+
+            metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+            results[original_idx] = {};
+        }
+    }
+
+    if (mem_cache_incs > 0) {
+        MasterMetricManager::instance().inc_mem_cache_nums(mem_cache_incs);
+    }
+    if (file_cache_incs > 0) {
+        MasterMetricManager::instance().inc_file_cache_nums(file_cache_incs);
+    }
+
     return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id, ReplicaType replica_type) {
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(
-            PutRevoke(client_id, key, tenant_id, replica_type));
+    std::vector<tl::expected<void, ErrorCode>> results(keys.size());
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
+
+    std::unordered_map<size_t,
+                       std::vector<std::pair<size_t, const std::string*>>>
+        keys_by_shard;
+    keys_by_shard.reserve(
+        std::min(keys.size(), static_cast<size_t>(kNumShards)));
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        size_t shard_idx = getMetadataShardIndex(normalized_tenant, keys[i]);
+        keys_by_shard[shard_idx].emplace_back(i, &keys[i]);
     }
+
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    int64_t mem_cache_decs = 0;
+    int64_t file_cache_decs = 0;
+
+    for (auto& [shard_idx, key_group] : keys_by_shard) {
+        MetadataShardAccessorRW shard(this, shard_idx);
+        for (const auto& [original_idx, key_ptr] : key_group) {
+            const std::string& key = *key_ptr;
+            auto tenant_it = shard->tenants.find(normalized_tenant);
+            if (tenant_it == shard->tenants.end()) {
+                LOG(INFO) << "key=" << key << ", info=object_not_found";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                continue;
+            }
+
+            auto& tenant_state = tenant_it->second;
+            auto it = tenant_state.metadata.find(key);
+            if (it == tenant_state.metadata.end() || !it->second.IsValid()) {
+                LOG(INFO) << "key=" << key << ", info=object_not_found";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                continue;
+            }
+
+            auto& metadata = it->second;
+            if (client_id != metadata.client_id) {
+                LOG(ERROR) << "Illegal client " << client_id
+                           << " to PutRevoke key " << key
+                           << ", was PutStart-ed by " << metadata.client_id;
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+                continue;
+            }
+
+            auto processing_rep = metadata.GetFirstReplica(
+                [replica_type](const Replica& replica) {
+                    if (replica_type == ReplicaType::ALL) {
+                        return (replica.is_memory_replica() ||
+                                replica.is_nof_replica()) &&
+                               !replica.is_processing();
+                    }
+                    return replica.type() == replica_type &&
+                           !replica.is_processing();
+                });
+            if (processing_rep != nullptr) {
+                LOG(ERROR) << "key=" << key
+                           << ", status=" << processing_rep->status()
+                           << ", error=invalid_replica_status";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::INVALID_WRITE);
+                continue;
+            }
+
+            if (replica_type == ReplicaType::MEMORY ||
+                (replica_type == ReplicaType::ALL &&
+                 metadata.HasMemReplica())) {
+                ++mem_cache_decs;
+            } else if (replica_type == ReplicaType::DISK) {
+                ++file_cache_decs;
+            }
+
+            metadata.EraseReplicas([replica_type](const Replica& replica) {
+                if (replica_type == ReplicaType::ALL) {
+                    return replica.is_memory_replica() ||
+                           replica.is_nof_replica();
+                }
+                return replica.type() == replica_type;
+            });
+
+            if (metadata.AllReplicas(&Replica::fn_is_completed)) {
+                tenant_state.processing_keys.erase(key);
+            }
+
+            if (!metadata.IsValid()) {
+                EraseMetadata(tenant_state, it, normalized_tenant);
+                if (tenant_state.Empty()) {
+                    shard->tenants.erase(tenant_it);
+                }
+            }
+
+            results[original_idx] = {};
+        }
+    }
+
+    if (mem_cache_decs > 0) {
+        MasterMetricManager::instance().dec_mem_cache_nums(mem_cache_decs);
+    }
+    if (file_cache_decs > 0) {
+        MasterMetricManager::instance().dec_file_cache_nums(file_cache_decs);
+    }
+
     return results;
 }
 

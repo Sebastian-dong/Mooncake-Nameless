@@ -96,9 +96,24 @@ class MasterServiceTest : public ::testing::Test {
     }
 
     std::string FindGroupIdOnDifferentShard(const std::string& key) const {
+        return FindGroupIdOnDifferentShard("default", key);
+    }
+
+    std::string FindGroupIdOnDifferentShard(const std::string& tenant_id,
+                                            const std::string& key) const {
         static constexpr size_t kMetadataShardCountForTest = 1024;
-        const size_t key_shard =
-            std::hash<std::string>{}(key) % kMetadataShardCountForTest;
+        const auto normalized_tenant =
+            tenant_id.empty() ? std::string("default") : tenant_id;
+        const size_t key_shard = [&]() {
+            if (normalized_tenant == "default") {
+                return std::hash<std::string>{}(key) %
+                       kMetadataShardCountForTest;
+            }
+            size_t seed = std::hash<std::string>{}(normalized_tenant);
+            seed ^= std::hash<std::string>{}(key) + 0x9e3779b9 + (seed << 6) +
+                    (seed >> 2);
+            return seed % kMetadataShardCountForTest;
+        }();
         for (int i = 0; i < 10000; ++i) {
             std::string group_id = key + "_group_" + std::to_string(i);
             if (std::hash<std::string>{}(group_id) %
@@ -1394,6 +1409,206 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     for (const auto& result : invalid_size_results) {
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    }
+}
+
+TEST_F(MasterServiceTest, BatchPutEndHandlesMixedResultsAndQueuesOffload) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    auto service_ = std::make_unique<MasterService>(config);
+    const auto segment_owner =
+        PrepareSimpleSegment(*service_, "batch_put_end_segment");
+    ASSERT_TRUE(service_->MountLocalDiskSegment(segment_owner.client_id, true)
+                    .has_value());
+
+    const UUID writer_client = generate_uuid();
+    const UUID other_writer = generate_uuid();
+    const std::string tenant_id = "batch_put_end_tenant";
+    const std::string missing_key = "batch_put_end_missing";
+    const std::string wrong_client_key = "batch_put_end_wrong_client";
+    const std::string ok_key = "batch_put_end_ok";
+
+    ReplicateConfig grouped_ok_config;
+    grouped_ok_config.replica_num = 1;
+    grouped_ok_config.group_ids = std::vector<std::string>{
+        FindGroupIdOnDifferentShard(tenant_id, ok_key)};
+    ASSERT_TRUE(service_
+                    ->PutStart(writer_client, ok_key, tenant_id, 1024,
+                               grouped_ok_config)
+                    .has_value());
+
+    ReplicateConfig grouped_wrong_config;
+    grouped_wrong_config.replica_num = 1;
+    grouped_wrong_config.group_ids = std::vector<std::string>{
+        FindGroupIdOnDifferentShard(tenant_id, wrong_client_key)};
+    ASSERT_TRUE(service_
+                    ->PutStart(other_writer, wrong_client_key, tenant_id, 1024,
+                               grouped_wrong_config)
+                    .has_value());
+
+    auto results = service_->BatchPutEnd(
+        writer_client, {missing_key, wrong_client_key, ok_key}, tenant_id,
+        ReplicaType::MEMORY);
+    ASSERT_EQ(results.size(), 3u);
+
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    ASSERT_FALSE(results[1].has_value());
+    EXPECT_EQ(results[1].error(), ErrorCode::ILLEGAL_CLIENT);
+
+    ASSERT_TRUE(results[2].has_value());
+
+    auto ok_get = service_->GetReplicaList(ok_key, tenant_id);
+    ASSERT_TRUE(ok_get.has_value());
+    ASSERT_EQ(ok_get->replicas.size(), 1u);
+    EXPECT_TRUE(ok_get->replicas[0].is_memory_replica());
+
+    auto wrong_client_get =
+        service_->GetReplicaList(wrong_client_key, tenant_id);
+    ASSERT_FALSE(wrong_client_get.has_value());
+    EXPECT_EQ(wrong_client_get.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    auto offload =
+        service_->OffloadObjectHeartbeat(segment_owner.client_id, true);
+    ASSERT_TRUE(offload.has_value());
+
+    auto ok_task = std::find_if(
+        offload->begin(), offload->end(), [&](const OffloadTaskItem& task) {
+            return task.tenant_id == tenant_id && task.key == ok_key;
+        });
+    ASSERT_TRUE(ok_task != offload->end());
+    EXPECT_EQ(ok_task->size, 1024);
+
+    auto wrong_task = std::find_if(
+        offload->begin(), offload->end(), [&](const OffloadTaskItem& task) {
+            return task.tenant_id == tenant_id && task.key == wrong_client_key;
+        });
+    EXPECT_EQ(wrong_task, offload->end());
+}
+
+TEST_F(MasterServiceTest, BatchPutRevokeHandlesMixedResultsAndErasesMetadata) {
+    auto service_ = std::make_unique<MasterService>();
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+
+    const UUID writer_client = generate_uuid();
+    const UUID other_writer = generate_uuid();
+    const std::string tenant_id = "batch_put_revoke_tenant";
+    const std::string missing_key = "batch_put_revoke_missing";
+    const std::string wrong_client_key = "batch_put_revoke_wrong_client";
+    const std::string completed_key = "batch_put_revoke_completed";
+    const std::string revoked_key = "batch_put_revoke_processing";
+
+    ReplicateConfig revoked_config;
+    revoked_config.replica_num = 1;
+    revoked_config.group_ids = std::vector<std::string>{
+        FindGroupIdOnDifferentShard(tenant_id, revoked_key)};
+    ASSERT_TRUE(service_
+                    ->PutStart(writer_client, revoked_key, tenant_id, 1024,
+                               revoked_config)
+                    .has_value());
+
+    ReplicateConfig wrong_config;
+    wrong_config.replica_num = 1;
+    wrong_config.group_ids = std::vector<std::string>{
+        FindGroupIdOnDifferentShard(tenant_id, wrong_client_key)};
+    ASSERT_TRUE(service_
+                    ->PutStart(other_writer, wrong_client_key, tenant_id, 1024,
+                               wrong_config)
+                    .has_value());
+
+    ReplicateConfig completed_config;
+    completed_config.replica_num = 1;
+    completed_config.group_ids = std::vector<std::string>{
+        FindGroupIdOnDifferentShard(tenant_id, completed_key)};
+    ASSERT_TRUE(service_
+                    ->PutStart(writer_client, completed_key, tenant_id, 1024,
+                               completed_config)
+                    .has_value());
+    ASSERT_TRUE(service_
+                    ->PutEnd(writer_client, completed_key, tenant_id,
+                             ReplicaType::MEMORY)
+                    .has_value());
+
+    auto results = service_->BatchPutRevoke(
+        writer_client,
+        {missing_key, wrong_client_key, completed_key, revoked_key}, tenant_id,
+        ReplicaType::MEMORY);
+    ASSERT_EQ(results.size(), 4u);
+
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    ASSERT_FALSE(results[1].has_value());
+    EXPECT_EQ(results[1].error(), ErrorCode::ILLEGAL_CLIENT);
+
+    ASSERT_FALSE(results[2].has_value());
+    EXPECT_EQ(results[2].error(), ErrorCode::INVALID_WRITE);
+
+    ASSERT_TRUE(results[3].has_value());
+
+    auto revoked_get = service_->GetReplicaList(revoked_key, tenant_id);
+    ASSERT_FALSE(revoked_get.has_value());
+    EXPECT_EQ(revoked_get.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    auto completed_get = service_->GetReplicaList(completed_key, tenant_id);
+    ASSERT_TRUE(completed_get.has_value());
+    ASSERT_EQ(completed_get->replicas.size(), 1u);
+    EXPECT_TRUE(completed_get->replicas[0].is_memory_replica());
+
+    auto wrong_client_get =
+        service_->GetReplicaList(wrong_client_key, tenant_id);
+    ASSERT_FALSE(wrong_client_get.has_value());
+    EXPECT_EQ(wrong_client_get.error(), ErrorCode::REPLICA_IS_NOT_READY);
+}
+
+TEST_F(MasterServiceTest, WrappedBatchPutRevokeUsesTenantAwareBatchPath) {
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    service_config.enable_metric_reporting = false;
+    WrappedMasterService service_(service_config);
+
+    Segment segment = MakeSegment("wrapped_batch_revoke_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_.MountSegment(segment, client_id).has_value());
+
+    const std::string tenant_id = "wrapped_batch_revoke_tenant";
+    const std::vector<std::string> keys = {
+        "wrapped_batch_revoke_grouped_a",
+        "wrapped_batch_revoke_ungrouped",
+        "wrapped_batch_revoke_grouped_b",
+    };
+    const std::vector<uint64_t> sizes = {1024, 2048, 4096};
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{
+        FindGroupIdOnDifferentShard(tenant_id, keys[0]), "",
+        FindGroupIdOnDifferentShard(tenant_id, keys[2])};
+
+    auto start_results =
+        service_.BatchPutStart(client_id, keys, sizes, config, tenant_id);
+    ASSERT_EQ(start_results.size(), keys.size());
+    for (const auto& result : start_results) {
+        ASSERT_TRUE(result.has_value()) << toString(result.error());
+    }
+
+    std::vector<std::string> revoke_keys = {"wrapped_batch_revoke_missing",
+                                            keys[2], keys[0], keys[1]};
+    auto revoke_results = service_.BatchPutRevoke(
+        client_id, revoke_keys, ReplicaType::MEMORY, tenant_id);
+    ASSERT_EQ(revoke_results.size(), revoke_keys.size());
+
+    ASSERT_FALSE(revoke_results[0].has_value());
+    EXPECT_EQ(revoke_results[0].error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    ASSERT_TRUE(revoke_results[1].has_value());
+    ASSERT_TRUE(revoke_results[2].has_value());
+    ASSERT_TRUE(revoke_results[3].has_value());
+
+    for (const auto& key : keys) {
+        EXPECT_FALSE(service_.GetReplicaList(key, tenant_id).has_value());
+        EXPECT_FALSE(service_.GetReplicaList(key, "default").has_value());
     }
 }
 
