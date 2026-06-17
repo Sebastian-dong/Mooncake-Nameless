@@ -8,6 +8,13 @@ add_executable(master_bench master_bench.cpp)
 target_link_libraries(master_bench PRIVATE cachelib_memory_allocator
                                            mooncake_store)
 
+# Add batch put completion benchmark executable
+add_executable(batch_put_completion_bench batch_put_completion_bench.cpp)
+target_link_libraries(
+  batch_put_completion_bench PRIVATE mooncake_store
+                                     cachelib_memory_allocator
+                                     gflags::gflags glog::glog pthread)
+
 # Add file interface benchmark executable
 add_executable(file_interface_bench file_interface_bench.cpp)
 target_link_libraries(file_interface_bench PRIVATE mooncake_store glog::glog)

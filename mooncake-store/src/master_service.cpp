@@ -1908,30 +1908,47 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     const std::string& tenant_id, ReplicaType replica_type) {
     std::vector<tl::expected<void, ErrorCode>> results(keys.size());
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
-
-    std::unordered_map<size_t,
-                       std::vector<std::pair<size_t, const std::string*>>>
-        keys_by_shard;
-    keys_by_shard.reserve(
-        std::min(keys.size(), static_cast<size_t>(kNumShards)));
-
-    for (size_t i = 0; i < keys.size(); ++i) {
-        size_t shard_idx = getMetadataShardIndex(normalized_tenant, keys[i]);
-        keys_by_shard[shard_idx].emplace_back(i, &keys[i]);
+    constexpr size_t kInvalidKeyIndex = std::numeric_limits<size_t>::max();
+    std::array<size_t, kNumShards> key_list_heads;
+    key_list_heads.fill(kInvalidKeyIndex);
+    std::vector<size_t> next_key_indexes(keys.size(), kInvalidKeyIndex);
+    {
+        std::shared_lock<std::shared_mutex> group_lock(group_routing_mutex_);
+        const bool has_group_routes = !object_group_ids_.empty();
+        for (size_t i = keys.size(); i > 0; --i) {
+            const size_t key_idx = i - 1;
+            size_t shard_idx;
+            if (!has_group_routes) {
+                shard_idx = getShardIndex(normalized_tenant, keys[key_idx]);
+            } else {
+                auto route_it = object_group_ids_.find(
+                    MakeTenantScopedKey(normalized_tenant, keys[key_idx]));
+                shard_idx =
+                    route_it == object_group_ids_.end()
+                        ? getShardIndex(normalized_tenant, keys[key_idx])
+                        : getShardIndex(route_it->second);
+            }
+            next_key_indexes[key_idx] = key_list_heads[shard_idx];
+            key_list_heads[shard_idx] = key_idx;
+        }
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     int64_t mem_cache_incs = 0;
     int64_t file_cache_incs = 0;
 
-    for (auto& [shard_idx, key_group] : keys_by_shard) {
+    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+        if (key_list_heads[shard_idx] == kInvalidKeyIndex) {
+            continue;
+        }
         MetadataShardAccessorRW shard(this, shard_idx);
-        for (const auto& [original_idx, key_ptr] : key_group) {
-            const std::string& key = *key_ptr;
+        for (size_t key_idx = key_list_heads[shard_idx];
+             key_idx != kInvalidKeyIndex; key_idx = next_key_indexes[key_idx]) {
+            const std::string& key = keys[key_idx];
             auto tenant_it = shard->tenants.find(normalized_tenant);
             if (tenant_it == shard->tenants.end()) {
                 LOG(ERROR) << "key=" << key << ", error=object_not_found";
-                results[original_idx] =
+                results[key_idx] =
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                 continue;
             }
@@ -1940,7 +1957,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
             auto it = tenant_state.metadata.find(key);
             if (it == tenant_state.metadata.end() || !it->second.IsValid()) {
                 LOG(ERROR) << "key=" << key << ", error=object_not_found";
-                results[original_idx] =
+                results[key_idx] =
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                 continue;
             }
@@ -1951,7 +1968,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
                 LOG(ERROR) << "Illegal client " << client_id
                            << " to PutEnd key " << key
                            << ", was PutStart-ed by " << metadata.client_id;
-                results[original_idx] =
+                results[key_idx] =
                     tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
                 continue;
             }
@@ -2008,7 +2025,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
             }
 
             metadata.GrantLease(0, default_kv_soft_pin_ttl_);
-            results[original_idx] = {};
+            results[key_idx] = {};
         }
     }
 
@@ -2027,30 +2044,47 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     const std::string& tenant_id, ReplicaType replica_type) {
     std::vector<tl::expected<void, ErrorCode>> results(keys.size());
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
-
-    std::unordered_map<size_t,
-                       std::vector<std::pair<size_t, const std::string*>>>
-        keys_by_shard;
-    keys_by_shard.reserve(
-        std::min(keys.size(), static_cast<size_t>(kNumShards)));
-
-    for (size_t i = 0; i < keys.size(); ++i) {
-        size_t shard_idx = getMetadataShardIndex(normalized_tenant, keys[i]);
-        keys_by_shard[shard_idx].emplace_back(i, &keys[i]);
+    constexpr size_t kInvalidKeyIndex = std::numeric_limits<size_t>::max();
+    std::array<size_t, kNumShards> key_list_heads;
+    key_list_heads.fill(kInvalidKeyIndex);
+    std::vector<size_t> next_key_indexes(keys.size(), kInvalidKeyIndex);
+    {
+        std::shared_lock<std::shared_mutex> group_lock(group_routing_mutex_);
+        const bool has_group_routes = !object_group_ids_.empty();
+        for (size_t i = keys.size(); i > 0; --i) {
+            const size_t key_idx = i - 1;
+            size_t shard_idx;
+            if (!has_group_routes) {
+                shard_idx = getShardIndex(normalized_tenant, keys[key_idx]);
+            } else {
+                auto route_it = object_group_ids_.find(
+                    MakeTenantScopedKey(normalized_tenant, keys[key_idx]));
+                shard_idx =
+                    route_it == object_group_ids_.end()
+                        ? getShardIndex(normalized_tenant, keys[key_idx])
+                        : getShardIndex(route_it->second);
+            }
+            next_key_indexes[key_idx] = key_list_heads[shard_idx];
+            key_list_heads[shard_idx] = key_idx;
+        }
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     int64_t mem_cache_decs = 0;
     int64_t file_cache_decs = 0;
 
-    for (auto& [shard_idx, key_group] : keys_by_shard) {
+    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+        if (key_list_heads[shard_idx] == kInvalidKeyIndex) {
+            continue;
+        }
         MetadataShardAccessorRW shard(this, shard_idx);
-        for (const auto& [original_idx, key_ptr] : key_group) {
-            const std::string& key = *key_ptr;
+        for (size_t key_idx = key_list_heads[shard_idx];
+             key_idx != kInvalidKeyIndex; key_idx = next_key_indexes[key_idx]) {
+            const std::string& key = keys[key_idx];
             auto tenant_it = shard->tenants.find(normalized_tenant);
             if (tenant_it == shard->tenants.end()) {
                 LOG(INFO) << "key=" << key << ", info=object_not_found";
-                results[original_idx] =
+                results[key_idx] =
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                 continue;
             }
@@ -2059,7 +2093,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
             auto it = tenant_state.metadata.find(key);
             if (it == tenant_state.metadata.end() || !it->second.IsValid()) {
                 LOG(INFO) << "key=" << key << ", info=object_not_found";
-                results[original_idx] =
+                results[key_idx] =
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                 continue;
             }
@@ -2069,7 +2103,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
                 LOG(ERROR) << "Illegal client " << client_id
                            << " to PutRevoke key " << key
                            << ", was PutStart-ed by " << metadata.client_id;
-                results[original_idx] =
+                results[key_idx] =
                     tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
                 continue;
             }
@@ -2088,7 +2122,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
                 LOG(ERROR) << "key=" << key
                            << ", status=" << processing_rep->status()
                            << ", error=invalid_replica_status";
-                results[original_idx] =
+                results[key_idx] =
                     tl::make_unexpected(ErrorCode::INVALID_WRITE);
                 continue;
             }
@@ -2120,7 +2154,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
                 }
             }
 
-            results[original_idx] = {};
+            results[key_idx] = {};
         }
     }
 
