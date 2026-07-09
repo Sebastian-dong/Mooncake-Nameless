@@ -8,7 +8,7 @@
 
 最终提交内容包括：
 
-- 本文档：作品说明、设计方案、实验结果、复现命令和社区贡献说明
+- 本文档：作品说明、设计方案、实验结果、复现命令和 PR 状态说明
 - 源码链接：fork 仓库、feature branch 和 PR 链接
 - PR 链接：6 个比赛相关 PR
 
@@ -20,10 +20,7 @@
 
 ## 3. 作品总览
 
-本作品包含 **6 个比赛相关 PR**：
-
-- 5 个队伍直接提交的 Mooncake PR
-- 1 个上游合作者合入、但明确采纳并致谢我们优化方向的社区影响 PR
+本作品包含 **6 个队伍直接提交的 Mooncake PR**。
 
 | PR | 方向 | 内容 | 状态 | 归属 |
 | --- | --- | --- | --- | --- |
@@ -32,7 +29,7 @@
 | [#2260](https://github.com/kvcache-ai/Mooncake/pull/2260) | Prefix Query | 为简单 regex / prefix query 增加 fast path | 已提交，未合入 | 队伍直接贡献 |
 | [#2355](https://github.com/kvcache-ai/Mooncake/pull/2355) | 存储鲁棒性 | 加强 bucket readback fallback 和相关 Store 语义 | 已提交，未合入 | 队伍直接贡献 |
 | [#2529](https://github.com/kvcache-ai/Mooncake/pull/2529) | HiCache Promotion | 将 promotion-on-hit backlog 从 heartbeat path 移出 | 已提交，未合入 | 队伍直接贡献 |
-| [#2405](https://github.com/kvcache-ai/Mooncake/pull/2405) | 社区影响 | 上游合作者采纳并致谢我们提出的 batch metadata fast-path 方向 | 上游已合入 | 社区采纳方向 |
+| [#2445](https://github.com/kvcache-ai/Mooncake/pull/2445) | Allocation Strategy | 增加 SizeClassAwareAllocationStrategy，降低混合 size-class 场景碎片率 | 已提交，未合入 | 队伍直接贡献 |
 
 ## 4. Baseline 策略
 
@@ -55,6 +52,7 @@
 | [#2260](https://github.com/kvcache-ai/Mooncake/pull/2260) | `079353e4b78369088bc82c60becabd045bef72c6` | `954d0fa6ddab24453787edb6c0bcc820a63cc800` | 已提交，未合入 |
 | [#2355](https://github.com/kvcache-ai/Mooncake/pull/2355) | `47b267a5a1130f34f73b69fb0e3f0f599461851c` | `96394111dac67f1fc10945f965f3fdd88c32fa8e` | 已提交，未合入 |
 | [#2529](https://github.com/kvcache-ai/Mooncake/pull/2529) | `652949eb0d194546a0c7046dd8ef0aea63780429` | `25a9606d1929302a5be30b0a4d6925187feac01d` | 已提交，未合入 |
+| [#2445](https://github.com/kvcache-ai/Mooncake/pull/2445) | `866ed32f6f8c351b900b805f9c15b00bdf0f5d07` | `67cff1f808f8c2439159fa879c02df306b1d132f` | 已提交，未合入 |
 
 ## 5. 设计方案
 
@@ -90,6 +88,20 @@ PR #2529 将 promotion 执行逻辑从 FileStorage heartbeat path 中移出。he
 
 这样可以避免长时间 promotion backlog 阻塞 heartbeat 进度。
 
+### 5.6 SizeClassAwareAllocationStrategy
+
+PR #2445 增加 `SizeClassAwareAllocationStrategy`，根据请求大小选择 segment，目标是在混合 size-class KVCache workload 下降低碎片率并减少 partial allocation。
+
+现有 `Random` 和 `FreeRatioFirst` 策略不会区分对象大小。小对象和大 KV block 混合竞争 segment 时，小对象可能消耗大对象后续需要的连续空洞，从而增加碎片率和不必要的 partial allocation。
+
+新策略按对象大小分类：
+
+- 小对象倾向打包到已经较碎片化的 segment
+- 中等对象在 free ratio 和 contiguous hole size 之间做平衡
+- 大对象优先选择 largest contiguous free region 更大的 segment
+
+该实现不修改 `OffsetAllocator` 内部，不改变公共 API，并保留 best-effort allocation 语义。
+
 ## 6. 实验结果
 
 ### 6.1 结果汇总
@@ -102,6 +114,7 @@ PR #2529 将 promotion 执行逻辑从 FileStorage heartbeat path 中移出。he
 | Prefix query | 50,000 keys，100 prefix groups，500 matches/query，100 iterations | 30.9364 ms/query | 1.84852 ms/query | prefix-oriented regex query 加速 16.74x |
 | Bucket readback | `bucket + use_uring=true`，重复 10 次 | 10/10 运行失败 | 10/10 运行成功 | 将 direct-read 失败 workload 转换为可完成 fallback path |
 | Promotion-on-hit | HiCache promotion drain benchmark | 40s timeout 前无对象完成提升 | 200.92-201.21 ms 内完成所有选中对象提升 | 将 promotion backlog 从 heartbeat critical path 移出 |
+| Size-class aware strategy | `size_class_churn`，100 segments，混合 size-class pattern | 现有策略碎片率更高 | `SizeClassAware` 平均碎片率降低约 28%-51% | 在策略层降低混合 size-class 场景碎片率 |
 
 ### 6.2 PR #2340：Size-class Fragmentation Benchmark
 
@@ -208,6 +221,34 @@ Workload：
 
 两次测试使用相同 master runtime 和 workload 参数，只替换 `store.so` / `engine.so`。
 
+### 6.7 PR #2445：SizeClassAwareAllocationStrategy
+
+评测方法使用 PR #2340 引入的 `size_class_churn` workload，在 allocation-strategy 层测量 fragmentation ratio、largest free region 和 full / partial / failed allocation。
+
+本地运行配置：
+
+- `segment_capacity=64MB`
+- `num_allocations=2000`
+- `prefill_pct=70`
+- `size_class_pattern=all`
+- `size_class_evict_ratio=0.02`
+
+100 segments 代表性结果：
+
+| Pattern | Skewed | Replica | Strategy | Frag avg | Frag p99 | Largest free MB | Full/Partial/Fail/Total |
+| --- | --- | ---: | --- | ---: | ---: | ---: | --- |
+| kv_mixed | no | 3 | Random | 0.1121 | 0.3629 | 3.2 | 1997/3/0/2000 |
+| kv_mixed | no | 3 | FreeRatioFirst | 0.1141 | 0.4126 | 3.2 | 1995/5/0/2000 |
+| kv_mixed | no | 3 | SizeClassAware | 0.0811 | 0.2881 | 3.2 | 1999/1/0/2000 |
+| dsa_pair | no | 2 | Random | 0.4354 | 0.6201 | 5.5 | 1969/31/0/2000 |
+| dsa_pair | no | 2 | FreeRatioFirst | 0.3879 | 0.5160 | 3.8 | 1966/34/0/2000 |
+| dsa_pair | no | 2 | SizeClassAware | 0.2316 | 0.4079 | 3.8 | 1986/14/0/2000 |
+| dsa_pair | yes | 3 | Random | 0.4328 | 0.5957 | 3.8 | 1928/72/0/2000 |
+| dsa_pair | yes | 3 | FreeRatioFirst | 0.5023 | 0.6498 | 5.0 | 1938/62/0/2000 |
+| dsa_pair | yes | 3 | SizeClassAware | 0.2124 | 0.3978 | 3.8 | 1978/22/0/2000 |
+
+在这些代表性混合 size-class 场景中，`SizeClassAware` 相比已有较强 baseline 将平均碎片率降低约 28%-51%，同时减少 partial allocation。
+
 ## 7. Demo 与复现命令
 
 ### 7.1 通用环境入口
@@ -281,17 +322,25 @@ cmake --build build --target promotion_on_hit_test -j$(nproc)
 
 完整性能 benchmark 还需要运行 metadata server 和 master endpoint。
 
-### 7.7 PR #2405 社区采纳说明
+### 7.7 PR #2445 SizeClassAware Strategy Demo
 
-PR #2405 由上游合作者实现并合入。我们不把它声明为自己的直接实现成果。
+```bash
+cmake --build build --target allocation_strategy_bench -j$(nproc)
 
-将其纳入比赛材料的原因是：该 PR 明确致谢 `@Dao007forever` 和 `@Sebastian-dong` 在 #2272 和 #2221 中提出并讨论 shard-grouped `BatchExistKey` / batch metadata fast-path 方向。
+./build/mooncake-store/benchmarks/allocation_strategy_bench \
+  --workload=size_class_churn \
+  --segment_capacity=64 \
+  --num_allocations=2000 \
+  --prefill_pct=70 \
+  --size_class_pattern=all \
+  --size_class_evict_ratio=0.02
+```
 
 ## 8. 源码与链接
 
 - Mooncake 上游仓库：<https://github.com/kvcache-ai/Mooncake>
 - 比赛 fork 仓库：<https://github.com/Sebastian-dong/Mooncake-Nameless>
-- 比赛材料分支：<https://github.com/Sebastian-dong/Mooncake-Nameless/tree/competition>
+- 比赛材料分支：<https://github.com/Sebastian-dong/Mooncake-Nameless/tree/competition-submission>
 
 | 分支 | 用途 |
 | --- | --- |
@@ -299,18 +348,11 @@ PR #2405 由上游合作者实现并合入。我们不把它声明为自己的�
 | `feat/part-3-prefix-query-fastpath` | Prefix-oriented regex fast path |
 | `feat/part-4-offsetallocator-size-class` | Size-class churn benchmark |
 | `feat/part-5-bucket-readback-fastpath` | Bucket readback fallback hardening |
+| `feat/part-6-size-class-aware-strategy` | SizeClassAwareAllocationStrategy |
 | `feat/part-7-hicache-group-read-path` | Promotion-on-hit backlog drain |
-| `competition` | 比赛交付材料 |
+| `competition-submission` | 比赛交付材料 |
 
-## 9. 社区贡献说明
-
-PR #2340 已合入 Mooncake，是直接的社区贡献。
-
-PR #2221、#2260、#2355、#2529 已提交到 Mooncake 上游并完成本地验证，但在比赛打包时仍处于 open 状态。
-
-PR #2405 由上游合作者实现并合入，不作为我们的直接实现成果统计。它的价值在于证明我们提交和讨论的 batch metadata fast-path 方向被上游认可并采纳。
-
-## 10. 限制与后续工作
+## 9. 限制与后续工作
 
 - 部分 PR 在比赛截止前尚未完成上游 review 或合入。
 - 不同 PR 的 baseline commit 不同，这是独立 PR 开发流程导致的正常结果。
